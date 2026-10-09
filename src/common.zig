@@ -713,6 +713,44 @@ pub fn timedWaitForIoClock(c: *ev.Completion, timeout: Timeout, clock: Clock) (T
         return waitForIo(c);
     }
 
+    // A runtime task can use the Waiter's own timer directly. This avoids the
+    // generic two-member race Group and its second completion dispatch on the
+    // overwhelmingly common path where the I/O finishes before the deadline.
+    // Threads that cannot park a task retain the blocking Group path below.
+    if (getWaitableTaskOrNull()) |task| {
+        var waiter = Waiter.init();
+        c.userdata = &waiter;
+        c.callback = null;
+        c.flags = .{ .defer_callback = false };
+
+        defer if (std.debug.runtime_safety) {
+            c.userdata = null;
+        };
+
+        try task.checkCancel();
+        task.getExecutor().loopAdd(c);
+        const completed_inline = waiter.mode.direct.notify.state.load(.acquire) != 0;
+        if (completed_inline) {
+            task.getExecutor().maybeYield(.reschedule, .no_cancel);
+            return;
+        }
+
+        waiter.timedWaitClock(1, timeout, clock, .allow_cancel) catch |err| {
+            task.getExecutor().loopCancel(c);
+            waiter.wait(1, .no_cancel);
+
+            // A natural I/O result that crossed the timeout/cancel request wins:
+            // preserve it and re-arm an external task cancellation for the next
+            // cancellation point, exactly as waitForIo does.
+            if (c.err) |io_err| {
+                if (io_err == error.Canceled) return err;
+            }
+            if (err == error.Canceled) task.recancel();
+            return;
+        };
+        return;
+    }
+
     var group = ev.Group.init(.race);
     var timer = ev.Timer.initClock(timeout, clock);
 
@@ -766,6 +804,65 @@ test "timedWaitForIo: completes before timeout" {
     // Short timer (10ms) with long timeout (1 second)
     var timer = ev.Timer.init(.{ .duration = .fromMilliseconds(10) });
     try timedWaitForIo(&timer.c, .{ .duration = .fromSeconds(1) });
+}
+
+test "timedWaitForIo: runtime task completes before timeout" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Worker = struct {
+        fn run() !void {
+            var timer = ev.Timer.init(.{ .duration = .fromMilliseconds(10) });
+            try timedWaitForIo(&timer.c, .{ .duration = .fromSeconds(1) });
+            try std.testing.expect(timer.c.err == null);
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{});
+    defer handle.cancel();
+    try handle.join();
+}
+
+test "timedWaitForIo: runtime task timeout settles canceled operation" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Worker = struct {
+        fn run() !void {
+            var timer = ev.Timer.init(.{ .duration = .fromSeconds(1) });
+            try std.testing.expectError(
+                error.Timeout,
+                timedWaitForIo(&timer.c, .fromMilliseconds(10)),
+            );
+            const io_err = timer.c.err orelse return error.TestExpectedError;
+            try std.testing.expect(io_err == error.Canceled);
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{});
+    defer handle.cancel();
+    try handle.join();
+}
+
+test "timedWaitForIo: runtime task cancellation settles operation" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Worker = struct {
+        fn run(started: *std.atomic.Value(bool)) (Cancelable || Timeoutable)!void {
+            started.store(true, .release);
+            var timer = ev.Timer.init(.{ .duration = .fromSeconds(1) });
+            return timedWaitForIo(&timer.c, .{ .duration = .fromSeconds(2) });
+        }
+    };
+
+    var started: std.atomic.Value(bool) = .init(false);
+    var handle = try rt.spawn(Worker.run, .{&started});
+    while (!started.load(.acquire)) try rt.sleep(.fromMicroseconds(100));
+    // Let the worker submit and park before requesting cancellation.
+    try rt.sleep(.fromMilliseconds(10));
+    handle.cancel();
+    try std.testing.expectError(error.Canceled, handle.getResult());
 }
 
 test "Waiter: futex-based timed wait with timeout" {
