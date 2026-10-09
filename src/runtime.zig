@@ -1565,6 +1565,26 @@ pub fn now() Timestamp {
     return .now(.monotonic);
 }
 
+/// Return the current event-loop awake-clock snapshot when `io` belongs to the
+/// task's current runtime, otherwise read `io`'s awake clock directly.
+///
+/// Event-loop code can use this for bookkeeping and deadlines that are allowed
+/// to share one timestamp across a scheduler scan. Unlike `std.Io.Clock.now`,
+/// the value deliberately does not advance while a task runs without yielding.
+/// The runtime refreshes it before and after every backend poll.
+pub fn cachedAwakeNow(io: std.Io) std.Io.Timestamp {
+    if (Runtime.fromIo(io)) |io_runtime| {
+        if (getCurrentExecutorOrNull()) |executor| {
+            if (executor.runtime == io_runtime) {
+                return .fromNanoseconds(
+                    @intCast(executor.loop.now().toNanoseconds()),
+                );
+            }
+        }
+    }
+    return std.Io.Clock.awake.now(io);
+}
+
 /// Sleep for a specified duration.
 pub fn sleep(duration: Duration) Cancelable!void {
     // Nothing to time: don't arm a loop timer just to yield.
@@ -2332,6 +2352,29 @@ test "runtime: now() returns monotonic time" {
     const end = runtime.now();
     try std.testing.expect(end.value > start.value);
     try std.testing.expect(start.durationTo(end).toMilliseconds() >= 10);
+}
+
+test "runtime: cached awake time advances only across an event-loop poll" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    const io = runtime.io();
+
+    const before = cachedAwakeNow(io);
+    os.time.sleep(.fromMilliseconds(2));
+    try std.testing.expectEqual(before.nanoseconds, cachedAwakeNow(io).nanoseconds);
+
+    try runtime.sleep(.fromMilliseconds(1));
+    try std.testing.expect(cachedAwakeNow(io).nanoseconds > before.nanoseconds);
+}
+
+test "runtime: cached awake time delegates for a foreign std.Io" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const before = cachedAwakeNow(io);
+    os.time.sleep(.fromMilliseconds(2));
+    try std.testing.expect(cachedAwakeNow(io).nanoseconds > before.nanoseconds);
 }
 
 test "runtime: sleep is cancelable" {

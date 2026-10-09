@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Added
+
+- Added `cachedAwakeNow`, which returns the current event-loop awake-clock
+  snapshot for a matching zio task and delegates to `std.Io.Clock.awake.now`
+  otherwise. Event-driven protocol code can share one timestamp across a
+  scheduler scan without weakening the standard clock API's freshness.
+
 ## [0.19.1] - 2026-10-06
 
 ### Changed
