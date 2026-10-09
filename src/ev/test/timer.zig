@@ -170,7 +170,7 @@ test "timer with explicit deadline" {
     var timer: Timer = .init(.{ .deadline = deadline });
 
     var wall_timer = time.Stopwatch.start();
-    loop.add(&timer.c);
+    loop.setTimer(&timer, timer.timeout);
     try loop.run();
     const elapsed = wall_timer.read();
 
@@ -178,6 +178,31 @@ test "timer with explicit deadline" {
     try std.testing.expect(elapsed.toMilliseconds() >= 90);
     try std.testing.expect(elapsed.toMilliseconds() <= 250);
     std.log.info("deadline timer: expected=100ms, actual={f}", .{elapsed});
+}
+
+test "absolute timer arm preserves the cached loop clock" {
+    var loop: Loop = undefined;
+    try loop.init(.{});
+    defer loop.deinit();
+
+    const scan_tick = loop.state.tick;
+    const scan_now = loop.now();
+    var absolute: Timer = .init(.{
+        .deadline = scan_now.addDuration(.fromSeconds(1)),
+    });
+    loop.setTimer(&absolute, absolute.timeout);
+
+    // Absolute deadlines need no new origin. In particular, std.Io callers
+    // can derive one deadline from the loop snapshot and reuse it across a
+    // batch without turning each I/O arm into another clock read.
+    try std.testing.expectEqual(scan_tick, loop.state.tick);
+    try std.testing.expectEqual(scan_now, loop.now());
+    try std.testing.expect(loop.clearTimer(&absolute));
+
+    var relative: Timer = .init(.{ .duration = .fromSeconds(1) });
+    loop.setTimer(&relative, relative.timeout);
+    try std.testing.expect(loop.state.tick != scan_tick);
+    try std.testing.expect(loop.clearTimer(&relative));
 }
 
 /// How late a wall-clock timer may fire before the test calls it a failure. This

@@ -643,9 +643,14 @@ pub const Loop = struct {
         // markCompleted pending outside this lock); rearm from the callback
         // (or after it), never concurrently with the fire.
         std.debug.assert(!(st.phase == .running and timer.c.has_result));
-        // Advance the scan so this timer's deadline is computed against a fresh
-        // `now` in its own clock (via `nowFor` in `armTimer`).
-        self.state.updateNow();
+        // A relative duration needs a fresh origin. An absolute deadline is
+        // already in its clock's epoch, so refreshing every task-local arm
+        // would only pay for a clock read and invalidate the scan snapshot.
+        // The next poll refreshes all timer comparisons before checking them.
+        switch (timeout) {
+            .duration => self.state.updateNow(),
+            .none, .deadline => {},
+        }
         timer.timeout = timeout;
         if (st.phase == .running) {
             self.state.disarmTimer(timer);
