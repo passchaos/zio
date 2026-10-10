@@ -27,6 +27,7 @@ const SigInt = if (is_pre_016) c_int else posix.SIG;
 // Stack growth signal handler state (POSIX only)
 threadlocal var altstack_installed: bool = false;
 threadlocal var altstack_mem: ?[]u8 = null;
+threadlocal var committed_high_water_target: ?*std.atomic.Value(usize) = null;
 var signal_handler_refcount: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 var old_sigsegv_action: posix.Sigaction = undefined;
 var old_sigbus_action: posix.Sigaction = undefined;
@@ -38,6 +39,33 @@ pub const StackInfo = extern struct {
     allocation_len: usize,
     valgrind_stack_id: usize = 0,
 };
+
+/// Number of pages currently committed for `info`, including the small
+/// allocator-owned area above the coroutine-visible `base` on POSIX.
+pub fn committedSize(info: StackInfo) usize {
+    const allocation_end = @intFromPtr(info.allocation_ptr) + info.allocation_len;
+    return allocation_end - info.limit;
+}
+
+/// Select the high-water counter updated by stack growth on this thread.
+/// Runtime executors bind their owning pool while its coroutine stacks can run.
+pub fn setCommittedHighWaterTarget(target: ?*std.atomic.Value(usize)) void {
+    committed_high_water_target = target;
+}
+
+pub fn recordCommittedHighWater(info: StackInfo) void {
+    const target = committed_high_water_target orelse return;
+    const committed = committedSize(info);
+    var observed = target.load(.monotonic);
+    while (committed > observed) {
+        observed = target.cmpxchgWeak(
+            observed,
+            committed,
+            .monotonic,
+            .monotonic,
+        ) orelse return;
+    }
+}
 
 pub fn stackAlloc(info: *StackInfo, maximum_size: usize, committed_size: usize) error{OutOfMemory}!void {
     if (builtin.os.tag == .windows) {
@@ -332,6 +360,7 @@ pub fn stackExtend(info: *StackInfo, mode: StackExtendMode) error{StackOverflow}
     } else {
         try stackExtendPosix(info, mode);
     }
+    recordCommittedHighWater(info.*);
 
     if (compat.is_debug and builtin.valgrind_support) {
         if (info.valgrind_stack_id != 0) {
@@ -629,6 +658,7 @@ fn stackFaultHandler(sig: SigInt, info: *const posix.siginfo_t, ctx: ?*anyopaque
             // Extension failed - this is a stack overflow
             abortOnStackOverflow(fault_addr, stack_info);
         };
+        recordCommittedHighWater(stack_info.*);
         // Stack extended successfully - return to resume execution
         return;
     }
@@ -742,6 +772,9 @@ test "Stack: automatic growth" {
     // Setup signal handler (no-op on Windows where PAGE_GUARD handles it automatically)
     try setupStackGrowth();
     defer cleanupStackGrowth();
+    var committed_high_water: std.atomic.Value(usize) = .init(0);
+    setCommittedHighWaterTarget(&committed_high_water);
+    defer setCommittedHighWaterTarget(null);
 
     var parent_context: coroutines.Context = undefined;
     var coro: coroutines.Coroutine = .{
@@ -793,6 +826,12 @@ test "Stack: automatic growth" {
     // Verify stack grew beyond initial commit
     const final_committed = coro.context.stack_info.base - coro.context.stack_info.limit;
     try std.testing.expect(final_committed >= initial_committed);
+    if (builtin.os.tag != .windows and builtin.os.tag != .openbsd) {
+        try std.testing.expectEqual(
+            committedSize(coro.context.stack_info),
+            committed_high_water.load(.monotonic),
+        );
+    }
 }
 
 test "Stack: recycle" {

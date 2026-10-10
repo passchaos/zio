@@ -13,6 +13,7 @@ pub const Scheduling = options.Scheduling;
 const runtime = @import("runtime.zig");
 pub const Runtime = runtime.Runtime;
 pub const RuntimeOptions = runtime.RuntimeOptions;
+pub const StackMetrics = runtime.StackMetrics;
 pub const JoinHandle = runtime.JoinHandle;
 pub const Placement = runtime.Placement;
 pub const ExecutorId = runtime.ExecutorId;

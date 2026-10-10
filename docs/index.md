@@ -16,6 +16,20 @@ A runtime can run single-threaded, or multi-threaded in one of two modes. With w
 pub const zio_options: zio.Options = .{ .scheduling = .pinned };
 ```
 
+## Coroutine stack sizing
+
+Each coroutine reserves up to 8 MiB of virtual address space by default and
+initially commits 256 KiB. Supported POSIX targets grow committed pages on
+demand, so the reservation is not equivalent to RSS. Applications with a
+strict address-space limit can override `RuntimeOptions.stack_pool`.
+
+After a representative workload, `Runtime.stackMetrics()` reports the
+configured sizes, active and retained stack counts, lifetime peak concurrency,
+largest per-stack committed extent, and current virtual reservation. The
+committed value is page-granular capacity rather than an exact stack-pointer
+measurement; it is intended to provide evidence for changing the default
+maximum instead of guessing from RSS.
+
 ## Features
 
 - Support for Linux (`io_uring` with automatic `epoll` fallback), Windows (`iocp`), macOS/FreeBSD/NetBSD/OpenBSD (`kqueue`), and many other systems (`poll`)

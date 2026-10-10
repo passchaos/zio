@@ -34,6 +34,7 @@ pub const cleanupStackGrowth = stack.cleanupStackGrowth;
 pub const crashHandler = stack.crashHandler;
 
 pub const StackPool = @import("stack_pool.zig").StackPool;
+pub const StackMetrics = @import("stack_pool.zig").Metrics;
 
 test {
     std.testing.refAllDecls(@This());

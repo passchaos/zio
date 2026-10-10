@@ -11,6 +11,12 @@ All notable changes to this project will be documented in this file.
   otherwise. Event-driven protocol code can share one timestamp across a
   scheduler scan without weakening the standard clock API's freshness.
 
+- Added `Runtime.stackMetrics()` for inspecting active and retained coroutine
+  stacks, lifetime peak concurrency, the largest per-stack committed extent,
+  and currently reserved virtual address space. POSIX stack growth updates the
+  committed high-water mark from the fault path, without adding work to normal
+  context switches.
+
 ## [0.19.1] - 2026-10-06
 
 ### Changed

@@ -87,6 +87,28 @@ pub const Config = struct {
     prewarm: usize = 0,
 };
 
+/// A point-in-time view of stack-pool capacity plus lifetime high-water marks.
+/// `peak_committed_bytes_per_stack` measures committed pages, not live stack
+/// usage. POSIX growth updates it immediately; platforms with OS-managed stack
+/// growth update it no later than the stack's next release.
+pub const Metrics = struct {
+    /// Requested usable ceiling for every stack, before page alignment.
+    configured_maximum_bytes: usize,
+    /// Requested initial commit for every stack, before page alignment.
+    configured_initial_committed_bytes: usize,
+    /// Stacks currently assigned to coroutine tasks.
+    active_stacks: usize,
+    /// Active and idle stack slots that have been initialized.
+    retained_stacks: usize,
+    /// Largest number of stacks concurrently active since pool creation.
+    peak_active_stacks: usize,
+    /// Largest page-aligned committed extent observed for one stack.
+    peak_committed_bytes_per_stack: usize,
+    /// Address space currently held by slabs and individual stack mappings.
+    /// This includes guard pages and slab slots that have not been used yet.
+    reserved_virtual_bytes: usize,
+};
+
 pub const StackPool = struct {
     config: Config,
     mutex: os.Mutex,
@@ -106,6 +128,17 @@ pub const StackPool = struct {
     slot_size: usize,
     /// Stacks currently acquired (both kinds).
     in_use: usize,
+    /// Individually mapped stacks, both active and idle. Slab-backed stacks
+    /// are counted from each slab's carved field when metrics are requested.
+    individual_mappings: usize,
+    /// Exact address space held by individually mapped stacks. This differs
+    /// from `individual_mappings * slot_size` on platforms whose native stack
+    /// allocator owns its guard-page layout.
+    individual_reserved_virtual_bytes: usize,
+    /// Lifetime high-water mark for concurrently acquired stacks.
+    peak_in_use: usize,
+    /// Lifetime high-water mark for committed pages in any one stack.
+    peak_committed_bytes_per_stack: std.atomic.Value(usize),
     /// Peak of `in_use` since the last shrink evaluation.
     epoch_peak: usize,
     /// The decayed demand watermark: how much total capacity the shrink
@@ -129,6 +162,10 @@ pub const StackPool = struct {
             .partial = null,
             .slot_size = @max(aligned_max + ps, ps * 2),
             .in_use = 0,
+            .individual_mappings = 0,
+            .individual_reserved_virtual_bytes = 0,
+            .peak_in_use = 0,
+            .peak_committed_bytes_per_stack = .init(0),
             .epoch_peak = 0,
             .retain_target = 0,
             .last_shrink = .zero,
@@ -150,6 +187,8 @@ pub const StackPool = struct {
         self.head = null;
         self.tail = null;
         self.pool_size = 0;
+        self.individual_mappings = 0;
+        self.individual_reserved_virtual_bytes = 0;
 
         // Free whole slab arenas; their FreeNodes and headers live inside.
         if (slab_supported) {
@@ -181,7 +220,7 @@ pub const StackPool = struct {
                     s.free = node.next;
                     if (s.free == null) self.unlinkPartial(s);
                     s.in_use += 1;
-                    self.noteAcquireLocked();
+                    self.noteAcquireLocked(node.stack_info);
                     return node.stack_info;
                 }
             }
@@ -189,7 +228,7 @@ pub const StackPool = struct {
             if (self.head) |node| {
                 const stack_info = node.stack_info;
                 self.removeNode(node);
-                self.noteAcquireLocked();
+                self.noteAcquireLocked(stack_info);
                 return stack_info;
             }
 
@@ -198,7 +237,7 @@ pub const StackPool = struct {
                 // new slab if the current one is exhausted. Done under the
                 // lock — carving is rare and the bookkeeping needs it anyway.
                 if (self.carveSlotLocked()) |stack_info| {
-                    self.noteAcquireLocked();
+                    self.noteAcquireLocked(stack_info);
                     return stack_info;
                 }
                 // Slab reservation failed (address space exhausted?); fall
@@ -212,13 +251,71 @@ pub const StackPool = struct {
 
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.noteAcquireLocked();
+        self.individual_mappings += 1;
+        self.individual_reserved_virtual_bytes += stack_info.allocation_len;
+        self.noteAcquireLocked(stack_info);
         return stack_info;
     }
 
-    fn noteAcquireLocked(self: *StackPool) void {
+    fn noteAcquireLocked(self: *StackPool, stack_info: StackInfo) void {
         self.in_use += 1;
+        self.peak_in_use = @max(self.peak_in_use, self.in_use);
         self.epoch_peak = @max(self.epoch_peak, self.in_use);
+        self.noteCommitted(stack_info);
+    }
+
+    fn noteReleaseLocked(self: *StackPool, stack_info: StackInfo) void {
+        self.in_use -= 1;
+        self.noteCommitted(stack_info);
+    }
+
+    fn noteCommitted(self: *StackPool, stack_info: StackInfo) void {
+        const committed = stack.committedSize(stack_info);
+        var observed = self.peak_committed_bytes_per_stack.load(.monotonic);
+        while (committed > observed) {
+            observed = self.peak_committed_bytes_per_stack.cmpxchgWeak(
+                observed,
+                committed,
+                .monotonic,
+                .monotonic,
+            ) orelse return;
+        }
+    }
+
+    /// Bind this pool's committed-page high-water counter to the current
+    /// thread's stack-growth handler. Runtime executors call this during init.
+    pub fn bindMetricsToCurrentThread(self: *StackPool) void {
+        stack.setCommittedHighWaterTarget(&self.peak_committed_bytes_per_stack);
+    }
+
+    /// Stop recording stack growth into this pool on the current thread.
+    pub fn unbindMetricsFromCurrentThread(_: *StackPool) void {
+        stack.setCommittedHighWaterTarget(null);
+    }
+
+    /// Return a synchronized snapshot without adding work to ordinary task
+    /// scheduling. Virtual bytes include complete slab reservations, including
+    /// slots not carved yet; committed high water is per stack, not aggregate.
+    pub fn metrics(self: *StackPool) Metrics {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var retained_stacks = self.individual_mappings;
+        var reserved_virtual_bytes = self.individual_reserved_virtual_bytes;
+        var slab = self.slabs;
+        while (slab) |s| : (slab = s.next) {
+            retained_stacks +|= s.carved;
+            reserved_virtual_bytes +|= s.memory.len;
+        }
+        return .{
+            .configured_maximum_bytes = self.config.maximum_size,
+            .configured_initial_committed_bytes = self.config.committed_size,
+            .active_stacks = self.in_use,
+            .retained_stacks = retained_stacks,
+            .peak_active_stacks = self.peak_in_use,
+            .peak_committed_bytes_per_stack = self.peak_committed_bytes_per_stack.load(.monotonic),
+            .reserved_virtual_bytes = reserved_virtual_bytes,
+        };
     }
 
     /// Releases a stack back to the pool. Never makes a syscall: slab slots
@@ -254,18 +351,20 @@ pub const StackPool = struct {
                 if (slab.free == null) self.linkPartial(slab);
                 slab.free = node;
                 slab.in_use -= 1;
-                self.in_use -= 1;
+                self.noteReleaseLocked(stack_info);
                 self.mutex.unlock();
                 return;
             }
         }
 
         self.mutex.lock();
-        self.in_use -= 1;
+        self.noteReleaseLocked(stack_info);
 
         // Verify the FreeNode fits within the committed region (between limit and base)
         if (node_addr < stack_info.limit) {
             // Stack is too small to hold the FreeNode, free it instead of pooling
+            self.individual_mappings -= 1;
+            self.individual_reserved_virtual_bytes -= stack_info.allocation_len;
             self.mutex.unlock();
             stack.stackFree(stack_info);
             return;
@@ -362,6 +461,8 @@ pub const StackPool = struct {
             while (excess > 0 and stack_budget > 0) {
                 const node = self.head orelse break;
                 self.removeNode(node);
+                self.individual_mappings -= 1;
+                self.individual_reserved_virtual_bytes -= node.stack_info.allocation_len;
                 node.next = stacks_to_free;
                 stacks_to_free = node;
                 excess -= 1;
@@ -542,6 +643,43 @@ test "StackPool basic acquire and release" {
     // Return it so pool.deinit() reclaims it (slab slots must not be
     // stackFree'd individually).
     pool.release(stack2);
+}
+
+test "StackPool metrics expose reservation and committed high water" {
+    const config: Config = .{
+        .maximum_size = 1024 * 1024,
+        .committed_size = 64 * 1024,
+    };
+    var pool = StackPool.init(config);
+    defer pool.deinit();
+    pool.bindMetricsToCurrentThread();
+    defer pool.unbindMetricsFromCurrentThread();
+
+    var info = try pool.acquire();
+    const initial_committed = stack.committedSize(info);
+    const active = pool.metrics();
+    try std.testing.expectEqual(config.maximum_size, active.configured_maximum_bytes);
+    try std.testing.expectEqual(config.committed_size, active.configured_initial_committed_bytes);
+    try std.testing.expectEqual(@as(usize, 1), active.active_stacks);
+    try std.testing.expectEqual(@as(usize, 1), active.retained_stacks);
+    try std.testing.expectEqual(@as(usize, 1), active.peak_active_stacks);
+    try std.testing.expectEqual(initial_committed, active.peak_committed_bytes_per_stack);
+    try std.testing.expect(active.reserved_virtual_bytes >= info.allocation_len);
+
+    if (builtin.os.tag != .windows and builtin.os.tag != .openbsd) {
+        try stack.stackExtend(&info, .grow);
+        try std.testing.expectEqual(
+            stack.committedSize(info),
+            pool.metrics().peak_committed_bytes_per_stack,
+        );
+        try std.testing.expect(stack.committedSize(info) > initial_committed);
+    }
+
+    pool.release(info);
+    const released = pool.metrics();
+    try std.testing.expectEqual(@as(usize, 0), released.active_stacks);
+    try std.testing.expectEqual(@as(usize, 1), released.retained_stacks);
+    try std.testing.expectEqual(@as(usize, 1), released.peak_active_stacks);
 }
 
 test "StackPool slab: carving spans slabs and slots are distinct" {
@@ -764,6 +902,12 @@ test "StackPool fallback: shrink frees idle stacks beyond the watermark" {
     pool.release(stack2);
     pool.release(stack3);
     try std.testing.expectEqual(3, pool.pool_size);
+    const retained = pool.metrics();
+    try std.testing.expectEqual(@as(usize, 3), retained.retained_stacks);
+    try std.testing.expectEqual(
+        stack1.allocation_len + stack2.allocation_len + stack3.allocation_len,
+        retained.reserved_virtual_bytes,
+    );
 
     // Peak covers the burst on the first pass; then the target halves per
     // interval (3 -> 1 -> 0), draining the pool over two more passes.
@@ -771,6 +915,8 @@ test "StackPool fallback: shrink frees idle stacks beyond the watermark" {
     try std.testing.expectEqual(3, pool.pool_size);
     pool.shrink(.fromSeconds(20));
     try std.testing.expectEqual(1, pool.pool_size);
+    try std.testing.expectEqual(@as(usize, 1), pool.metrics().retained_stacks);
     pool.shrink(.fromSeconds(30));
     try std.testing.expectEqual(0, pool.pool_size);
+    try std.testing.expectEqual(@as(usize, 0), pool.metrics().reserved_virtual_bytes);
 }

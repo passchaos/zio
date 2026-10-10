@@ -23,8 +23,10 @@ const Timestamp = time.Timestamp;
 
 const Coroutine = @import("coro/coroutines.zig").Coroutine;
 const Context = @import("coro/coroutines.zig").Context;
-const StackPool = @import("coro/stack_pool.zig").StackPool;
-const StackPoolConfig = @import("coro/stack_pool.zig").Config;
+const stack_pool = @import("coro/stack_pool.zig");
+const StackPool = stack_pool.StackPool;
+const StackPoolConfig = stack_pool.Config;
+pub const StackMetrics = stack_pool.Metrics;
 const setupStackGrowth = @import("coro/stack.zig").setupStackGrowth;
 const cleanupStackGrowth = @import("coro/stack.zig").cleanupStackGrowth;
 
@@ -602,6 +604,8 @@ pub const Executor = struct {
 
         try setupStackGrowth();
         errdefer cleanupStackGrowth();
+        self.runtime.stack_pool.bindMetricsToCurrentThread();
+        errdefer self.runtime.stack_pool.unbindMetricsFromCurrentThread();
 
         // Initialize this executor's random state from OS entropy.
         try random_mod.setup(&self.random_state);
@@ -639,6 +643,7 @@ pub const Executor = struct {
 
         self.loop.deinit();
 
+        self.runtime.stack_pool.unbindMetricsFromCurrentThread();
         cleanupStackGrowth();
     }
 
@@ -2017,6 +2022,13 @@ pub const Runtime = struct {
         return total;
     }
 
+    /// Snapshot coroutine stack capacity and lifetime high-water marks.
+    /// Reading this acquires the stack-pool mutex but task execution and stack
+    /// growth do not: growth only updates one lock-free atomic maximum.
+    pub fn stackMetrics(self: *Runtime) StackMetrics {
+        return self.stack_pool.metrics();
+    }
+
     /// Whether other executors can steal from this runtime's queues. The
     /// executor list only grows during init, before any worker runs.
     pub inline fn stealingActive(self: *Runtime) bool {
@@ -2206,6 +2218,36 @@ test "Runtime: scheduler metrics count parks and drained wakes" {
     try std.testing.expect(m.drain_woken >= 1);
     try std.testing.expect(m.drain_batches >= 1);
     try std.testing.expect(m.parks_doze + m.parks_full >= 1);
+}
+
+test "Runtime: stack metrics describe completed coroutine capacity" {
+    const maximum_size = 512 * 1024;
+    const committed_size = 64 * 1024;
+    const runtime = try Runtime.init(std.testing.allocator, .{
+        .stack_pool = .{
+            .maximum_size = maximum_size,
+            .committed_size = committed_size,
+            .slab_slots = 2,
+        },
+    });
+    defer runtime.deinit();
+
+    var handle = try runtime.spawn(struct {
+        fn run() void {}
+    }.run, .{});
+    handle.join();
+
+    const metrics = runtime.stackMetrics();
+    try std.testing.expectEqual(maximum_size, metrics.configured_maximum_bytes);
+    try std.testing.expectEqual(
+        committed_size,
+        metrics.configured_initial_committed_bytes,
+    );
+    try std.testing.expectEqual(@as(usize, 0), metrics.active_stacks);
+    try std.testing.expectEqual(@as(usize, 1), metrics.retained_stacks);
+    try std.testing.expectEqual(@as(usize, 1), metrics.peak_active_stacks);
+    try std.testing.expect(metrics.peak_committed_bytes_per_stack >= committed_size);
+    try std.testing.expect(metrics.reserved_virtual_bytes >= maximum_size);
 }
 
 test "Runtime: metrics monitor thread starts and stops" {
