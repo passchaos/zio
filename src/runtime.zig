@@ -510,14 +510,6 @@ pub const Executor = struct {
     // the hot path).
     tick_checkpoint_countdown: u32 = checkpoint_interval,
 
-    // Real-clock snapshot for std.Io response metadata and similar bookkeeping
-    // that may share one timestamp across an event-loop scan. Kept separate
-    // from LoopState's timer clocks so reading it never touches timer state or
-    // its cross-thread lock. Owner thread only.
-    cached_real_now: std.Io.Timestamp = .zero,
-    cached_real_tick: u64 = 0,
-    cached_real_valid: bool = false,
-
     // Scheduler event counters; written only by this executor's thread.
     metrics: MetricsStorage = metrics_storage_init,
 
@@ -1598,29 +1590,6 @@ pub fn cachedAwakeNow(io: std.Io) std.Io.Timestamp {
     return std.Io.Clock.awake.now(io);
 }
 
-/// Return one real-clock snapshot per event-loop scan when `io` belongs to the
-/// current executor's runtime, otherwise read `io`'s real clock directly.
-///
-/// This is intended for wall-clock metadata such as an HTTP `Date` header. It
-/// must not be used for deadlines: a task can run multiple operations within
-/// one scan, during which this value deliberately remains unchanged.
-pub fn cachedRealNow(io: std.Io) std.Io.Timestamp {
-    if (Runtime.fromIo(io)) |io_runtime| {
-        if (getCurrentExecutorOrNull()) |executor| {
-            if (executor.runtime == io_runtime) {
-                const scan_tick = executor.loop.scanTick();
-                if (!executor.cached_real_valid or executor.cached_real_tick != scan_tick) {
-                    executor.cached_real_now = std.Io.Clock.real.now(io);
-                    executor.cached_real_tick = scan_tick;
-                    executor.cached_real_valid = true;
-                }
-                return executor.cached_real_now;
-            }
-        }
-    }
-    return std.Io.Clock.real.now(io);
-}
-
 /// Sleep for a specified duration.
 pub fn sleep(duration: Duration) Cancelable!void {
     // Nothing to time: don't arm a loop timer just to yield.
@@ -2448,29 +2417,6 @@ test "runtime: cached awake time delegates for a foreign std.Io" {
     const before = cachedAwakeNow(io);
     os.time.sleep(.fromMilliseconds(2));
     try std.testing.expect(cachedAwakeNow(io).nanoseconds > before.nanoseconds);
-}
-
-test "runtime: cached real time advances only across an event-loop poll" {
-    const runtime = try Runtime.init(std.testing.allocator, .{});
-    defer runtime.deinit();
-    const io = runtime.io();
-
-    const before = cachedRealNow(io);
-    os.time.sleep(.fromMilliseconds(2));
-    try std.testing.expectEqual(before.nanoseconds, cachedRealNow(io).nanoseconds);
-
-    try runtime.sleep(.fromMilliseconds(1));
-    try std.testing.expect(cachedRealNow(io).nanoseconds > before.nanoseconds);
-}
-
-test "runtime: cached real time delegates for a foreign std.Io" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    const before = cachedRealNow(io);
-    os.time.sleep(.fromMilliseconds(2));
-    try std.testing.expect(cachedRealNow(io).nanoseconds > before.nanoseconds);
 }
 
 test "runtime: sleep is cancelable" {

@@ -20,11 +20,6 @@ All notable changes to this project will be documented in this file.
   otherwise. Event-driven protocol code can share one timestamp across a
   scheduler scan without weakening the standard clock API's freshness.
 
-- Added `cachedRealNow`, which reads a matching runtime's real clock at most
-  once per event-loop scan for wall-clock metadata such as HTTP `Date`, while
-  foreign `std.Io` implementations continue to read their own clock directly.
-  Deadline and timer code remains on the uncached clock paths.
-
 - Added `Runtime.stackMetrics()` for inspecting active and retained coroutine
   stacks, lifetime peak concurrency, the largest per-stack committed extent,
   and currently reserved virtual address space. POSIX stack growth updates the
