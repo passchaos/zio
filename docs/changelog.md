@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Changed
+
+- Timed runtime I/O now links its operation directly to the deadline timer
+  after the operation proves it must park. Natural completion removes the
+  timer without completing a generic race-group sibling, while timeout and
+  external cancellation still wait for the underlying operation to settle.
+  Already-ready I/O retains the timer-free inline path, and simultaneous
+  operation/deadline completion continues to preserve the natural I/O result.
+
 ### Added
 
 - Added `cachedAwakeNow`, which returns the current event-loop awake-clock

@@ -718,9 +718,10 @@ pub fn timedWaitForIoClock(c: *ev.Completion, timeout: Timeout, clock: Clock) (T
     // overwhelmingly common path where the I/O finishes before the deadline.
     // Threads that cannot park a task retain the blocking Group path below.
     if (getWaitableTaskOrNull()) |task| {
-        var waiter = Waiter.init();
-        c.userdata = &waiter;
-        c.callback = null;
+        var wait = TimedIoWait.init(c, timeout, clock);
+        wait.bind();
+        c.userdata = &wait;
+        c.callback = TimedIoWait.ioCallback;
         c.flags = .{ .defer_callback = false };
 
         defer if (std.debug.runtime_safety) {
@@ -729,15 +730,30 @@ pub fn timedWaitForIoClock(c: *ev.Completion, timeout: Timeout, clock: Clock) (T
 
         try task.checkCancel();
         task.getExecutor().loopAdd(c);
-        const completed_inline = waiter.mode.direct.notify.state.load(.acquire) != 0;
+        const completed_inline = wait.waiter.mode.direct.notify.state.load(.acquire) != 0;
         if (completed_inline) {
             task.getExecutor().maybeYield(.reschedule, .no_cancel);
             return;
         }
 
-        waiter.timedWaitClock(1, timeout, clock, .allow_cancel) catch |err| {
+        // Preserve waitForIo's inline fast path: only arm a timer after the
+        // operation has proved it needs to park. A completion racing this
+        // transition either signals us before the claim or leaves io_done for
+        // the arming side to settle after the timer becomes addressable.
+        if (!wait.beginTimerArm()) {
+            wait.waiter.wait(1, .no_cancel);
+            return;
+        }
+        task.getExecutor().loopSetTimer(&wait.timer, timeout);
+        const state_after_arm = wait.finishTimerArm();
+        if (state_after_arm & TimedIoWait.io_done != 0) {
+            const timer_loop = wait.timer.c.getLoop().?;
+            if (!timer_loop.clearTimer(&wait.timer)) {
+                wait.waiter.wait(1, .no_cancel);
+            }
+        } else wait.waiter.wait(1, .allow_cancel) catch |err| {
             task.getExecutor().loopCancel(c);
-            waiter.wait(1, .no_cancel);
+            wait.waiter.wait(1, .no_cancel);
 
             // A natural I/O result that crossed the timeout/cancel request wins:
             // preserve it and re-arm an external task cancellation for the next
@@ -748,6 +764,11 @@ pub fn timedWaitForIoClock(c: *ev.Completion, timeout: Timeout, clock: Clock) (T
             if (err == error.Canceled) task.recancel();
             return;
         };
+        if (c.err) |io_err| {
+            if (io_err == error.Canceled and wait.timerFired()) {
+                return error.Timeout;
+            }
+        }
         return;
     }
 
@@ -779,6 +800,111 @@ pub fn timedWaitForIoClock(c: *ev.Completion, timeout: Timeout, clock: Clock) (T
         }
     }
 }
+
+/// Stack-owned rendezvous for one timed I/O operation. Both completions are
+/// submitted to the same loop. The common success path therefore removes the
+/// timer directly from that loop's heap and wakes the task without completing
+/// a generic race-group sibling. The atomic state also covers a future backend
+/// that finishes the I/O from a different loop while the timer is firing.
+const TimedIoWait = struct {
+    const io_done: u8 = 1 << 0;
+    const timer_arming: u8 = 1 << 1;
+    const timer_armed: u8 = 1 << 2;
+    const timer_done: u8 = 1 << 3;
+
+    waiter: Waiter,
+    timer: ev.Timer,
+    io: *ev.Completion,
+    state: std.atomic.Value(u8),
+
+    fn init(
+        io: *ev.Completion,
+        timeout: Timeout,
+        clock: Clock,
+    ) TimedIoWait {
+        return .{
+            .waiter = .init(),
+            .timer = .initClock(timeout, clock),
+            .io = io,
+            .state = .init(0),
+        };
+    }
+
+    fn bind(self: *TimedIoWait) void {
+        self.timer.c.userdata = self;
+        self.timer.c.callback = timerCallback;
+        self.timer.c.flags = .{ .defer_callback = false };
+    }
+
+    fn timerFired(self: *const TimedIoWait) bool {
+        return self.state.load(.acquire) & timer_done != 0;
+    }
+
+    fn beginTimerArm(self: *TimedIoWait) bool {
+        var old = self.state.load(.acquire);
+        while (true) {
+            if (old & io_done != 0) return false;
+            old = self.state.cmpxchgWeak(
+                old,
+                old | timer_arming,
+                .acq_rel,
+                .acquire,
+            ) orelse return true;
+        }
+    }
+
+    fn finishTimerArm(self: *TimedIoWait) u8 {
+        var old = self.state.load(.acquire);
+        while (true) {
+            std.debug.assert(old & timer_arming != 0);
+            const new = (old & ~timer_arming) | timer_armed;
+            old = self.state.cmpxchgWeak(
+                old,
+                new,
+                .acq_rel,
+                .acquire,
+            ) orelse return old;
+        }
+    }
+
+    fn ioCallback(_: *ev.Loop, c: *ev.Completion) void {
+        const self: *TimedIoWait = @ptrCast(@alignCast(c.userdata.?));
+        const previous = self.state.fetchOr(io_done, .acq_rel);
+        if (previous & timer_armed != 0) {
+            const timer_loop = self.timer.c.getLoop().?;
+            const cleared = timer_loop.clearTimer(&self.timer);
+            if (cleared) {
+                // Nothing below may touch `self`: the woken task can
+                // immediately migrate, return, and release this stack frame.
+                self.waiter.signal();
+                return;
+            }
+            if (previous & timer_done != 0) {
+                self.waiter.signal();
+            }
+        } else if (previous & timer_arming == 0) {
+            // Completion won before the owner committed to arming a timer.
+            // The owner will observe io_done and cannot publish one later.
+            self.waiter.signal();
+        }
+    }
+
+    fn timerCallback(loop: *ev.Loop, c: *ev.Completion) void {
+        const self: *TimedIoWait = @ptrCast(@alignCast(c.userdata.?));
+        // Cache the I/O pointer before publishing timer_done. An I/O callback
+        // on another loop may observe the bit, wake the task, and thereby make
+        // `self` unreachable as soon as this callback returns or cancels it.
+        const io = self.io;
+        const previous = self.state.fetchOr(timer_done, .acq_rel);
+        if (previous & io_done != 0) {
+            self.waiter.signal();
+            return;
+        }
+        // This is the last operation: same-loop cancellation can synchronously
+        // run ioCallback, which may wake a task on another executor.
+        loop.cancel(io);
+    }
+};
 
 test "waitForIo: basic timer completion" {
     var rt = try Runtime.init(std.testing.allocator, .{});
@@ -823,6 +949,24 @@ test "timedWaitForIo: runtime task completes before timeout" {
     try handle.join();
 }
 
+test "timedWaitForIo: precompleted runtime I/O skips an expired timer" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Worker = struct {
+        fn run() !void {
+            var ready = ev.Async.init();
+            ready.notify();
+            try timedWaitForIo(&ready.c, .{ .duration = .zero });
+            try std.testing.expect(ready.c.err == null);
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{});
+    defer handle.cancel();
+    try handle.join();
+}
+
 test "timedWaitForIo: runtime task timeout settles canceled operation" {
     const rt = try Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
@@ -836,6 +980,30 @@ test "timedWaitForIo: runtime task timeout settles canceled operation" {
             );
             const io_err = timer.c.err orelse return error.TestExpectedError;
             try std.testing.expect(io_err == error.Canceled);
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{});
+    defer handle.cancel();
+    try handle.join();
+}
+
+test "timedWaitForIo: simultaneous timer and operation preserves I/O result" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Worker = struct {
+        fn run() !void {
+            const deadline = Timestamp.now(.awake).addDuration(
+                .fromMilliseconds(10),
+            );
+            var timer = ev.Timer.init(.{ .deadline = deadline });
+            try timedWaitForIoClock(
+                &timer.c,
+                .{ .deadline = deadline },
+                .awake,
+            );
+            try std.testing.expect(timer.c.err == null);
         }
     };
 
