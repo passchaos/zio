@@ -619,6 +619,16 @@ pub const Loop = struct {
         return self.state.now[0];
     }
 
+    /// Return the current event-loop scan generation.
+    ///
+    /// Owner-thread caches may use this as an invalidation key: `poll` advances
+    /// it whenever the loop starts a new scan. It deliberately exposes only the
+    /// generation, not the timer subsystem's cached wall-clock values.
+    pub fn scanTick(self: *const Loop) u64 {
+        self.assertOwnThread();
+        return self.state.tick;
+    }
+
     /// Wake up the loop from another thread (thread-safe). Costs a syscall
     /// only when the loop is sleeping in its poll and nobody has woken it yet.
     pub fn wake(self: *Loop) void {
