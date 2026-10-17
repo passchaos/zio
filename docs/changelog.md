@@ -10,8 +10,9 @@ All notable changes to this project will be documented in this file.
   after the operation proves it must park. Natural completion removes the
   timer without completing a generic race-group sibling, while timeout and
   external cancellation still wait for the underlying operation to settle.
-  Already-ready I/O retains the timer-free inline path, and simultaneous
-  operation/deadline completion continues to preserve the natural I/O result.
+  Already-ready I/O retains the timer-free inline path without constructing
+  unused timer state, and simultaneous operation/deadline completion continues
+  to preserve the natural I/O result.
 
 ### Added
 

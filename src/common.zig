@@ -718,8 +718,7 @@ pub fn timedWaitForIoClock(c: *ev.Completion, timeout: Timeout, clock: Clock) (T
     // overwhelmingly common path where the I/O finishes before the deadline.
     // Threads that cannot park a task retain the blocking Group path below.
     if (getWaitableTaskOrNull()) |task| {
-        var wait = TimedIoWait.init(c, timeout, clock);
-        wait.bind();
+        var wait = TimedIoWait.init(c);
         c.userdata = &wait;
         c.callback = TimedIoWait.ioCallback;
         c.flags = .{ .defer_callback = false };
@@ -744,6 +743,7 @@ pub fn timedWaitForIoClock(c: *ev.Completion, timeout: Timeout, clock: Clock) (T
             wait.waiter.wait(1, .no_cancel);
             return;
         }
+        wait.initTimer(timeout, clock);
         task.getExecutor().loopSetTimer(&wait.timer, timeout);
         const state_after_arm = wait.finishTimerArm();
         if (state_after_arm & TimedIoWait.io_done != 0) {
@@ -817,20 +817,21 @@ const TimedIoWait = struct {
     io: *ev.Completion,
     state: std.atomic.Value(u8),
 
-    fn init(
-        io: *ev.Completion,
-        timeout: Timeout,
-        clock: Clock,
-    ) TimedIoWait {
+    fn init(io: *ev.Completion) TimedIoWait {
         return .{
             .waiter = .init(),
-            .timer = .initClock(timeout, clock),
+            .timer = undefined,
             .io = io,
             .state = .init(0),
         };
     }
 
-    fn bind(self: *TimedIoWait) void {
+    fn initTimer(
+        self: *TimedIoWait,
+        timeout: Timeout,
+        clock: Clock,
+    ) void {
+        self.timer = .initClock(timeout, clock);
         self.timer.c.userdata = self;
         self.timer.c.callback = timerCallback;
         self.timer.c.flags = .{ .defer_callback = false };
