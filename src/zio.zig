@@ -16,6 +16,9 @@ pub const RuntimeOptions = runtime.RuntimeOptions;
 pub const StackMetrics = runtime.StackMetrics;
 pub const JoinHandle = runtime.JoinHandle;
 pub const Placement = runtime.Placement;
+pub const SpawnLocality = runtime.SpawnLocality;
+pub const setSpawnLocality = runtime.setSpawnLocality;
+pub const getSpawnLocality = runtime.getSpawnLocality;
 pub const ExecutorId = runtime.ExecutorId;
 
 // Standalone task functions

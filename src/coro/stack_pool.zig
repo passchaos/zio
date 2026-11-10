@@ -4,7 +4,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const stack = @import("stack.zig");
-const StackInfo = stack.StackInfo;
+pub const StackInfo = stack.StackInfo;
 const Timestamp = @import("../time.zig").Timestamp;
 const Duration = @import("../time.zig").Duration;
 const os = @import("../os/root.zig");

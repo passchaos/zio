@@ -195,6 +195,10 @@ pub const AnyTask = struct {
     /// Only ever accessed by the task itself, so it needs no synchronization.
     tls_head: ?*TaskLocalNode = null,
 
+    /// Placement hint for tasks this task spawns through `.auto` (see
+    /// `SpawnLocality`). Owned by the task, so it needs no synchronization.
+    spawn_locality: runtime.SpawnLocality = .spread,
+
     /// Task state and park token, packed into a single byte for atomic operations.
     ///
     /// The `awaken` bit implements a NetBSD-style park token:
@@ -479,7 +483,17 @@ pub const AnyTask = struct {
     /// `allocation_len` marking the resources as already released.
     pub fn releaseCoro(self: *AnyTask, rt: *Runtime) void {
         if (self.coro.context.stack_info.allocation_len == 0) return;
-        rt.stack_pool.release(self.coro.context.stack_info);
+        // Reuse the completed stack for the next task on this executor. The
+        // cache slot and the task lifecycle are owned by the executor thread;
+        // a full slot falls back to the shared pool.
+        const executor = runtime.getCurrentExecutorOrNull();
+        if (executor != null and executor.?.runtime == rt and
+            executor.?.cacheStack(self.coro.context.stack_info))
+        {
+            // Retained locally.
+        } else {
+            rt.stack_pool.release(self.coro.context.stack_info);
+        }
         self.coro.context.stack_info.allocation_len = 0;
         self.coro.deinit();
     }
@@ -551,8 +565,13 @@ pub const AnyTask = struct {
         };
 
         // Acquire stack from pool and initialize context. Nothing below can
-        // fail, so the acquired stack needs no errdefer release here.
-        self.coro.context.stack_info = try executor.runtime.stack_pool.acquire();
+        // fail, so the acquired stack needs no errdefer release here. Prefer
+        // the executor-local cache to avoid the shared pool lock on repeated
+        // short-lived tasks.
+        self.coro.context.stack_info = if (executor.takeCachedStack()) |info|
+            info
+        else
+            try executor.runtime.stack_pool.acquire();
 
         // Copy context data into the allocation
         const context_dest = self.closure.getContextSlice(AnyTask, self);

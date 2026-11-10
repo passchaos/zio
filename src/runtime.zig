@@ -26,6 +26,7 @@ const Context = @import("coro/coroutines.zig").Context;
 const stack_pool = @import("coro/stack_pool.zig");
 const StackPool = stack_pool.StackPool;
 const StackPoolConfig = stack_pool.Config;
+const StackInfo = stack_pool.StackInfo;
 pub const StackMetrics = stack_pool.Metrics;
 const setupStackGrowth = @import("coro/stack.zig").setupStackGrowth;
 const cleanupStackGrowth = @import("coro/stack.zig").cleanupStackGrowth;
@@ -362,7 +363,8 @@ pub fn getNextExecutor(rt: *Runtime) error{RuntimeShutdown}!*Executor {
 /// life, which holds only when tasks never migrate, so there they fail with
 /// `error.InvalidPlacement`.
 pub const Placement = union(enum) {
-    /// Let the runtime pick the executor. This is what `spawn` does.
+    /// Let the runtime pick the executor. This is what `spawn` does; the
+    /// calling task's `SpawnLocality` hint refines the choice.
     auto,
     /// The executor of the calling thread. Fails with `error.InvalidPlacement`
     /// when called from a thread that is not an executor of this runtime.
@@ -371,10 +373,50 @@ pub const Placement = union(enum) {
     executor: ExecutorId,
 };
 
+/// Placement preference applied to tasks spawned through `.auto` while the
+/// calling task runs. Scoped to one task and irrelevant to explicit
+/// placements. Stealable and migratable either way: this is a locality hint,
+/// not a pin.
+pub const SpawnLocality = enum {
+    /// Spread new tasks round-robin across executors (the default). A task's
+    /// first executor also decides where its I/O lives on loop-per-thread
+    /// backends, so spreading matters for socket-heavy workloads.
+    spread,
+    /// Home new tasks on the calling executor, keeping a structured group of
+    /// tasks (a connection pump and its select arms, for example) on one
+    /// executor while leaving them stealable by idle ones. Falls back to
+    /// `.spread` when the caller is not on an executor of the same runtime.
+    local,
+};
+
+/// Set the spawn locality hint for the calling task. No-op outside a task, so
+/// code paths shared with foreign `std.Io` implementations stay unaffected.
+pub fn setSpawnLocality(locality: SpawnLocality) void {
+    if (getCurrentTaskOrNull()) |task| task.spawn_locality = locality;
+}
+
+/// The calling task's spawn locality hint, or `.spread` outside a task.
+pub fn getSpawnLocality() SpawnLocality {
+    const task = getCurrentTaskOrNull() orelse return .spread;
+    return task.spawn_locality;
+}
+
 pub const PlacementError = error{ RuntimeShutdown, InvalidPlacement };
 
 pub fn getPlacementExecutor(rt: *Runtime, placement: Placement) PlacementError!*Executor {
-    if (placement == .auto) return getNextExecutor(rt);
+    if (placement == .auto) {
+        if (getSpawnLocality() == .local) {
+            if (getCurrentExecutorOrNull()) |executor| {
+                if (executor.runtime == rt) {
+                    if (rt.shutting_down.load(.acquire)) {
+                        return error.RuntimeShutdown;
+                    }
+                    return executor;
+                }
+            }
+        }
+        return getNextExecutor(rt);
+    }
     if (migrates) return error.InvalidPlacement;
 
     if (rt.shutting_down.load(.acquire)) {
@@ -556,6 +598,13 @@ pub const Executor = struct {
     // Owning thread only, so no atomics.
     no_suspend: u32 = 0,
 
+    /// One completed task stack retained by this executor. Task spawn and
+    /// finish run on the owning thread, so taking or returning it needs no
+    /// lock. The atomic pointer lets `stackMetrics` count cached stacks
+    /// without racing the owning thread.
+    cached_stack: std.atomic.Value(?*StackInfo) = .init(null),
+    cached_stack_storage: StackInfo = undefined,
+
     // Executor dedicated to this thread. Written once on init, never updated.
     pub threadlocal var current_DO_NOT_ACCESS_DIRECTLY: ?*Executor = null;
 
@@ -637,7 +686,27 @@ pub const Executor = struct {
         self.current_task = &self.main_task;
     }
 
+    /// Take the executor-local cached stack, if any. Owner thread only: task
+    /// creation may target a different executor than the caller's, and the
+    /// slot's storage is written by the owner without synchronization.
+    pub fn takeCachedStack(self: *Executor) ?StackInfo {
+        if (getCurrentExecutorOrNull() != self) return null;
+        const pointer = self.cached_stack.swap(null, .acquire) orelse return null;
+        return pointer.*;
+    }
+
+    /// Retain one completed stack for the next task on this executor. Returns
+    /// false when the slot is already occupied; the caller then releases the
+    /// stack to the shared pool. Owner thread only.
+    pub fn cacheStack(self: *Executor, info: StackInfo) bool {
+        if (self.cached_stack.load(.acquire) != null) return false;
+        self.cached_stack_storage = info;
+        self.cached_stack.store(&self.cached_stack_storage, .release);
+        return true;
+    }
+
     pub fn deinit(self: *Executor) void {
+        if (self.takeCachedStack()) |info| self.runtime.stack_pool.release(info);
         setCurrentExecutor(null);
         Coroutine.clearCurrent();
 
@@ -2026,7 +2095,15 @@ pub const Runtime = struct {
     /// Reading this acquires the stack-pool mutex but task execution and stack
     /// growth do not: growth only updates one lock-free atomic maximum.
     pub fn stackMetrics(self: *Runtime) StackMetrics {
-        return self.stack_pool.metrics();
+        var metrics = self.stack_pool.metrics();
+        // Executor-local cached stacks remain counted as in-use by the pool
+        // (they are not on its free list), but they back no running task.
+        var cached: usize = 0;
+        for (self.executors.items) |executor| {
+            if (executor.cached_stack.load(.acquire) != null) cached += 1;
+        }
+        metrics.active_stacks -|= cached;
+        return metrics;
     }
 
     /// Whether other executors can steal from this runtime's queues. The
@@ -2824,6 +2901,39 @@ test "runtime: spawnInto local placement from a foreign thread" {
     const thread = try std.Thread.spawn(.{}, H.foreign, .{ runtime, &result });
     thread.join();
     try std.testing.expectEqual(error.InvalidPlacement, result.?);
+}
+
+test "runtime: spawn locality hint homes auto placement on the calling executor" {
+    if (!multi_executor) return error.SkipZigTest;
+
+    const H = struct {
+        fn hinted(rt: *Runtime) !void {
+            const executor = getCurrentExecutorOrNull().?;
+            try std.testing.expectEqual(SpawnLocality.spread, getSpawnLocality());
+            setSpawnLocality(.local);
+            try std.testing.expectEqual(SpawnLocality.local, getSpawnLocality());
+            try std.testing.expectEqual(executor, try getPlacementExecutor(rt, .auto));
+        }
+
+        fn spread() !void {
+            try std.testing.expectEqual(SpawnLocality.spread, getSpawnLocality());
+        }
+    };
+
+    const runtime = try Runtime.init(std.testing.allocator, .{ .executors = .exact(4) });
+    defer runtime.deinit();
+
+    var handle = try runtime.spawn(H.hinted, .{runtime});
+    try handle.join();
+
+    // The hint is scoped to the task that set it; a later task starts spread.
+    var second = try runtime.spawn(H.spread, .{});
+    try second.join();
+}
+
+test "runtime: spawn locality hint outside a task is a no-op" {
+    setSpawnLocality(.local);
+    try std.testing.expectEqual(SpawnLocality.spread, getSpawnLocality());
 }
 
 test "runtime: multi-threaded execution with max executors" {
